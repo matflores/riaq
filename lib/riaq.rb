@@ -1,6 +1,9 @@
 require "riak"
 
 module Riaq
+  PENDING = 0
+  PROCESSING = 1
+
   class Queue
     attr :bucket
 
@@ -12,6 +15,7 @@ module Riaq
       item = @bucket.new(Time.now.to_f)
       item.content_type = "text/plain"
       item.data = value
+      item.indexes = { status_int: PENDING }
       item.store
     end
 
@@ -21,18 +25,17 @@ module Riaq
       loop do
         break if @stopping
 
-        key = bucket.get_index("$bucket", @bucket.name, max_results: 1).first
+        key = bucket.get_index("status_int", PENDING, max_results: 1).first
 
-        # FIXME cycling when a non-existing key is returned is slow
-        #       but 2i index doesn't seem to get immediately updated
-        #       when the item gets deleted from the queue.
-        next unless key && bucket.exists?(key)
+        next unless key
 
-        item = @bucket.get(key).data
+        item = @bucket.get(key)
+        item.indexes = { status_int: PROCESSING }
+        item.store
 
-        @bucket.delete(key)
+        block.call(item.data)
 
-        block.call(item)
+        item.delete
       end
     end
 
@@ -47,13 +50,11 @@ module Riaq
     end
 
     def items
-      # FIXME items should always be returned in the same order
-      Riak::MapReduce.new(riak).index(@bucket.name, "$bucket", @bucket.name).map("Riak.mapValues", keep: true).run
+      Riak::MapReduce.new(riak).index(@bucket.name, "status_int", PENDING).map("Riak.mapValues", keep: true).run
     end
 
     def size
-      # FIXME optimize filter
-      bucket.get_index("$bucket", @bucket.name).select { |key| key && bucket.exists?(key) }.size
+      bucket.get_index("status_int", PENDING).size
     end
 
     def empty?
